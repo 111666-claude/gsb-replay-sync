@@ -1,11 +1,12 @@
 // Package replaysync 确定性回放：同一份输入指令必须给出同一个结果。
-// 缺陷：同帧指令按 map 迭代顺序应用；每秒推进量写死 60 帧（忽略真实帧率）；校验和只覆盖 X[0]。
 package replaysync
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"strings"
+	"math"
+	"slices"
 )
 
 // ErrInput 表示指令不合法。
@@ -22,46 +23,58 @@ type Command struct {
 type World struct {
 	X   []float64
 	Y   []float64
-	Sum []string
+	Sum []uint64
 }
 
-// Replay 逐帧回放。缺陷：dt 参数被忽略，固定按 1/60 秒推进；指令顺序取自 map。
+// Replay 逐帧回放。每帧推进量为 speed * dt；同帧指令按玩家编号稳定排序后应用；
+// 每帧摘要覆盖全部玩家的 X、Y，与指令给出顺序无关。
 func Replay(frames [][]Command, players int, dt float64) (*World, error) {
 	if players <= 0 {
 		return nil, ErrInput
 	}
-	world := &World{X: make([]float64, players), Y: make([]float64, players)}
+	if dt <= 0 || math.IsNaN(dt) || math.IsInf(dt, 0) {
+		return nil, ErrInput
+	}
+	world := &World{
+		X:   make([]float64, players),
+		Y:   make([]float64, players),
+		Sum: make([]uint64, 0, len(frames)),
+	}
+	ordered := make([]Command, 0, 64)
 	for _, commands := range frames {
-		order := map[int]Command{} // 缺陷：map 迭代顺序每次都不同
-		for _, command := range commands {
+		ordered = append(ordered[:0], commands...)
+		slices.SortStableFunc(ordered, func(a, b Command) int {
+			return cmp.Compare(a.Player, b.Player)
+		})
+		for _, command := range ordered {
 			if command.Player < 0 || command.Player >= players {
 				return nil, ErrInput
 			}
-			order[command.Player] = command
+			world.X[command.Player] += command.DX * dt
+			world.Y[command.Player] += command.DY * dt
 		}
-		for player, command := range order {
-			world.X[player] += command.DX * (1.0 / 60.0) // 缺陷：忽略 dt，恒定按 60 帧推进
-			world.Y[player] += command.DY * (1.0 / 60.0)
-		}
-		world.Sum = append(world.Sum, digest(world, order)) // 缺陷：digest 依赖 map 顺序
+		world.Sum = append(world.Sum, digest(world))
 	}
 	return world, nil
 }
 
-func digest(world *World, order map[int]Command) string {
-	parts := []string{}
-	for player := range order {
-		parts = append(parts, fmt.Sprintf("%d@%.3f,%.3f", player, world.X[player], world.Y[player]))
+// digest 按玩家编号顺序把每个玩家的 X、Y 混入哈希，覆盖全部状态。
+func digest(world *World) uint64 {
+	const prime = 1099511628211
+	h := uint64(14695981039346656037)
+	for player := range world.X {
+		h = (h ^ math.Float64bits(world.X[player])) * prime
+		h = (h ^ math.Float64bits(world.Y[player])) * prime
 	}
-	return strings.Join(parts, "|")
+	return h
 }
 
-// Checksum 缺陷：只把 X[0] 拿来当校验和，Y 与其它玩家被篡改都发现不了。
+// Checksum 覆盖所有玩家的 X 与 Y，篡改任何一项都会改变结果。
 func Checksum(world *World) string {
-	if len(world.X) == 0 {
+	if world == nil || len(world.X) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%.3f", world.X[0])
+	return fmt.Sprintf("%016x", digest(world))
 }
 
 // Script 生成一段固定脚本：玩家 0..players-1 每帧各走一步，其中第 3 帧有两人撞到同一格。
